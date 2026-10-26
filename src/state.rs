@@ -259,15 +259,22 @@ impl<'a> State<'a> {
       }
     }
 
-    // A colored span (for example a command in inline code) wins over regex matches inside it.
+    // A colored span (for example a command in inline code) wins over regex matches inside or across it.
+    // A regex match that holds the whole span (for example a full command from @thumbs-regexp) keeps it.
     for (y, spans) in self.spans.iter().enumerate() {
       for &(start, end) in spans {
-        matches.retain(|m| !(m.y == y as i32 && (m.x as usize) < end && m.x as usize + m.text.len() > start));
+        let y = y as i32;
+        let (start_x, end_x) = (start as i32, end as i32);
+        let inside = |m: &Match| m.y == y && m.x <= start_x && m.x + m.text.len() as i32 >= end_x;
+        if matches.iter().any(inside) {
+          continue;
+        }
+        matches.retain(|m| !(m.y == y && m.x < end_x && m.x + m.text.len() as i32 > start_x));
         matches.push(Match {
-          x: start as i32,
-          y: y as i32,
+          x: start_x,
+          y,
           pattern: "span",
-          text: &self.lines[y][start..end],
+          text: &self.lines[y as usize][start..end],
           hint: None,
         });
       }
@@ -335,6 +342,22 @@ mod tests {
     let texts = results.iter().map(|m| m.text).collect::<Vec<_>>();
     assert_eq!(texts, ["chezmoi re-add ~/.bashrc", "/tmp/a"]);
     assert_eq!(results.first().unwrap().hint.clone().unwrap(), "a");
+  }
+
+  #[test]
+  fn match_holding_span_wins() {
+    // A command line colored per token: only `git push` has the span color.
+    let raw = "$ \x1b[38;2;0;255;136mgit push\x1b[39m -q origin && \x1b[38;2;0;255;136mls\x1b[39m";
+    let (plain, spans) = parse_ansi(raw, &[(0, 255, 136)]);
+
+    let lines = vec![plain.as_str()];
+    let custom = [r"(?:\$ |&& )(?P<match>[^&\s]+(?: [^&\s]+)*)"].to_vec();
+    let mut state = State::new(&lines, "abcd", &custom);
+    state.spans = vec![spans];
+    let results = state.matches(false, false);
+
+    let texts = results.iter().map(|m| m.text).collect::<Vec<_>>();
+    assert_eq!(texts, ["git push -q origin", "ls"]);
   }
 
   #[test]

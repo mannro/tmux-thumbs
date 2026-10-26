@@ -193,8 +193,8 @@ set -g @thumbs-regexp-5 Vlan\\d+ # alternative method of defining regexp
 `default: none`
 
 Matches every run of text drawn in one of these 24-bit foreground colors (`#rrggbb`, comma separated) as one hint,
-for example a whole command shown as inline code. The span wins over regex matches inside it. When set, the
-pane is captured with `capture-pane -e`.
+for example a whole command shown as inline code. The span wins over regex matches inside it or across it, but a
+regex match that holds the whole span (for example a full command from `@thumbs-regexp-N`) keeps it.
 
 For example:
 
