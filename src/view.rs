@@ -311,10 +311,11 @@ impl<'a> View<'a> {
 
 const NO_UNDERLINE: &str = "\x1b[24;59m";
 
-/// Underline escape in `color` (SGR 58). termion has no underline color, so reuse its foreground escape.
+/// Dotted underline (`4:4`, like URLs in foot) in `color` (SGR 58). termion has neither, so reuse its
+/// foreground escape for the color.
 fn underline(color: &dyn color::Color) -> String {
   let foreground = color::Fg(color).to_string();
-  format!("{}{}", style::Underline, foreground.replace("[38;", "[58;").replace("[39m", "[59m"))
+  format!("\x1b[4:4m{}", foreground.replace("[38;", "[58;").replace("[39m", "[59m"))
 }
 
 /// Prints `raw` (a captured line with escapes) and underlines `marks`: plain text byte ranges with their
