@@ -120,11 +120,9 @@ impl<'a> View<'a> {
     }
 
     for mat in self.matches.iter() {
-      // Find long utf sequences and extract it from mat.x
-      let line = &self.state.lines[mat.y as usize];
-      let prefix = &line[0..mat.x as usize];
-      let extra = prefix.width_cjk() - prefix.chars().count();
-      let offset = (mat.x as u16) - (extra as u16);
+      // Screen column of the match: mat.x is a byte offset, but `č` or `│` take one column.
+      // Not width_cjk: tmux draws ambiguous chars (box drawing) one column wide.
+      let offset = self.state.lines[mat.y as usize][..mat.x as usize].width() as u16;
       let text = self.make_hint_text(mat.text);
 
       if self.chosen.iter().any(|(hint, _)| hint == mat.text) {
@@ -143,9 +141,9 @@ impl<'a> View<'a> {
 
       if let Some(ref hint) = mat.hint {
         let extra_position = match self.position {
-          "right" => text.width_cjk() - hint.len(),
+          "right" => text.width() - hint.len(),
           "off_left" => 0 - hint.len() - if self.contrast { 2 } else { 0 },
-          "off_right" => text.width_cjk(),
+          "off_right" => text.width(),
           _ => 0,
         };
 
