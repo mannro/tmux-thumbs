@@ -2,19 +2,18 @@
 name = "thumbs"
 version = "0.8.0"
 authors = ["Ferran Basora <fcsonline@gmail.com>"]
-edition = "2018"
+edition = "2024"
 description = "A lightning fast version copy/pasting like vimium/vimperator"
 repository = "https://github.com/fcsonline/tmux-thumbs"
 keywords = ["rust", "tmux", "tmux-plugin", "vimium", "vimperator"]
 license = "MIT"
 
 [dependencies]
-termion = "1.5.6"
-regex = "1.7.1"
-clap = "2.34.0"
-base64 = "0.13.1"
-unicode-width = "0.1.10"
-lazy_static = "1.4.0"
+termion = "4"
+regex = "1"
+clap = { version = "4", features = ["derive"] }
+base64 = "0.23"
+unicode-width = "0.2"
 
 [[bin]]
 name = "thumbs"

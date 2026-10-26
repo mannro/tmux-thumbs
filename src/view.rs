@@ -1,309 +1,222 @@
-use super::*;
-use std::char;
-use std::io::{stdout, Read, Write};
-use termion::async_stdin;
+use crate::colors::Color;
+use crate::state::{self, Match, Token};
+use crate::{Args, Position};
+use std::io::{self, Write, stdout};
 use termion::event::Key;
 use termion::input::TermRead;
 use termion::raw::IntoRawMode;
-use termion::screen::AlternateScreen;
+use termion::screen::IntoAlternateScreen;
 use termion::{color, cursor, style};
-
 use unicode_width::UnicodeWidthStr;
 
 pub struct View<'a> {
-  state: &'a mut state::State<'a>,
+  /// Plain text lines, the matches point into them.
+  lines: &'a [&'a str],
+  /// The same lines with escape sequences, drawn with their original colors.
+  raw: &'a [&'a str],
+  matches: Vec<Match<'a>>,
+  args: &'a Args,
+  /// Index of the selected match.
   skip: usize,
+  /// Starts as `args.multi`, a space turns it on.
   multi: bool,
-  contrast: bool,
-  position: &'a str,
-  matches: Vec<state::Match<'a>>,
-  select_foreground_color: Box<dyn color::Color>,
-  multi_foreground_color: Box<dyn color::Color>,
-  multi_background_color: Box<dyn color::Color>,
-  foreground_color: Box<dyn color::Color>,
-  hint_background_color: Box<dyn color::Color>,
-  hint_foreground_color: Box<dyn color::Color>,
+  /// Picked texts and whether they were picked with an upcase hint.
   chosen: Vec<(String, bool)>,
 }
 
-enum CaptureEvent {
-  Exit,
-  Hint,
-}
-
 impl<'a> View<'a> {
-  pub fn new(
-    state: &'a mut state::State<'a>,
-    multi: bool,
-    reverse: bool,
-    unique: bool,
-    contrast: bool,
-    position: &'a str,
-    select_foreground_color: Box<dyn color::Color>,
-    multi_foreground_color: Box<dyn color::Color>,
-    multi_background_color: Box<dyn color::Color>,
-    foreground_color: Box<dyn color::Color>,
-    hint_foreground_color: Box<dyn color::Color>,
-    hint_background_color: Box<dyn color::Color>,
-  ) -> View<'a> {
-    let matches = state.matches(reverse, unique);
-    let skip = if reverse { matches.len() - 1 } else { 0 };
-
+  pub fn new(lines: &'a [&'a str], raw: &'a [&'a str], matches: Vec<Match<'a>>, args: &'a Args) -> View<'a> {
     View {
-      state,
-      skip,
-      multi,
-      contrast,
-      position,
+      lines,
+      raw,
+      skip: if args.reverse {
+        matches.len().saturating_sub(1)
+      } else {
+        0
+      },
       matches,
-      select_foreground_color,
-      multi_foreground_color,
-      multi_background_color,
-      foreground_color,
-      hint_foreground_color,
-      hint_background_color,
+      args,
+      multi: args.multi,
       chosen: vec![],
     }
   }
 
-  pub fn prev(&mut self) {
-    if self.skip > 0 {
-      self.skip -= 1;
-    }
+  fn prev(&mut self) {
+    self.skip = self.skip.saturating_sub(1);
   }
 
-  pub fn next(&mut self) {
-    if self.skip < self.matches.len() - 1 {
+  fn next(&mut self) {
+    if self.skip + 1 < self.matches.len() {
       self.skip += 1;
     }
   }
 
-  fn make_hint_text(&self, hint: &str) -> String {
-    if self.contrast {
-      format!("[{}]", hint)
-    } else {
-      hint.to_string()
-    }
-  }
+  fn render(&self, out: &mut impl Write, typed_hint: &str) -> io::Result<()> {
+    let args = self.args;
+    write!(out, "{}", cursor::Hide)?;
 
-  fn render(&self, stdout: &mut dyn Write, typed_hint: &str) -> () {
-    write!(stdout, "{}", cursor::Hide).unwrap();
-
-    let selected = self.matches.get(self.skip);
-
-    for (index, line) in self.state.lines.iter().enumerate() {
-      let clean = line.trim_end_matches(|c: char| c.is_whitespace());
-
-      if !clean.is_empty() {
-        let mut marks = self
-          .matches
-          .iter()
-          .filter(|mat| mat.y == index as i32)
-          .map(|mat| {
-            let color = if selected == Some(mat) {
-              &self.select_foreground_color
-            } else {
-              &self.foreground_color
-            };
-            (mat.x as usize, mat.x as usize + mat.text.len(), underline(&**color))
-          })
-          .collect::<Vec<_>>();
-        marks.sort_by_key(|mark| mark.0);
-
-        let raw = self.state.raw.get(index).copied().unwrap_or(line);
-        print!(
-          "{goto}{text}",
-          goto = cursor::Goto(1, index as u16 + 1),
-          text = underline_ranges(raw, &marks)
-        );
+    for (y, &line) in self.lines.iter().enumerate() {
+      if line.trim_end().is_empty() {
+        continue;
       }
+
+      let mut marks = self
+        .matches
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.y == y)
+        .map(|(index, m)| {
+          let color = if index == self.skip {
+            args.select_fg_color
+          } else {
+            args.fg_color
+          };
+          (m.x, m.x + m.text.len(), underline(color))
+        })
+        .collect::<Vec<_>>();
+      marks.sort_by_key(|mark| mark.0);
+
+      let raw = self.raw.get(y).copied().unwrap_or(line);
+      write!(
+        out,
+        "{}{}",
+        cursor::Goto(1, y as u16 + 1),
+        underline_ranges(raw, &marks)
+      )?;
     }
 
-    for mat in self.matches.iter() {
-      // Screen column of the match: mat.x is a byte offset, but `č` or `│` take one column.
+    for m in &self.matches {
+      // Screen column of the match: m.x is a byte offset, but `č` or `│` take one column.
       // Not width_cjk: tmux draws ambiguous chars (box drawing) one column wide.
-      let offset = self.state.lines[mat.y as usize][..mat.x as usize].width() as u16;
-      let text = self.make_hint_text(mat.text);
+      let column = self.lines[m.y][..m.x].width() as isize;
+      let row = m.y as u16 + 1;
+      let text = hint_text(m.text, args.contrast);
 
-      if self.chosen.iter().any(|(hint, _)| hint == mat.text) {
-        print!(
-          "{goto}{background}{foregroud}{underline}{text}{nounderline}{resetf}{resetb}",
-          goto = cursor::Goto(offset + 1, mat.y as u16 + 1),
-          foregroud = color::Fg(&*self.multi_foreground_color),
-          background = color::Bg(&*self.multi_background_color),
-          underline = style::Underline,
-          nounderline = style::NoUnderline,
-          resetf = color::Fg(color::Reset),
-          resetb = color::Bg(color::Reset),
-          text = &text
-        );
+      if self.chosen.iter().any(|(chosen, _)| chosen == m.text) {
+        write!(
+          out,
+          "{}{}{}{}{}{}{}{}",
+          cursor::Goto(column as u16 + 1, row),
+          color::Bg(args.multi_bg_color),
+          color::Fg(args.multi_fg_color),
+          style::Underline,
+          text,
+          style::NoUnderline,
+          color::Fg(color::Reset),
+          color::Bg(color::Reset),
+        )?;
       }
 
-      if let Some(ref hint) = mat.hint {
-        let extra_position = match self.position {
-          "right" => text.width() - hint.len(),
-          "off_left" => 0 - hint.len() - if self.contrast { 2 } else { 0 },
-          "off_right" => text.width(),
-          _ => 0,
-        };
+      let Some(hint) = &m.hint else { continue };
+      let hint_label = hint_text(hint, args.contrast);
+      let shift = match args.position {
+        Position::Left => 0,
+        Position::Right => text.width() as isize - hint.len() as isize,
+        Position::OffLeft => -(hint_label.width() as isize),
+        Position::OffRight => text.width() as isize,
+      };
+      let goto = cursor::Goto((column + shift).max(0) as u16 + 1, row);
 
-        let text = self.make_hint_text(hint.as_str());
-        let final_position = std::cmp::max(offset as i16 + extra_position as i16, 0);
+      write!(
+        out,
+        "{goto}{}{}{hint_label}{}{}",
+        color::Bg(args.hint_bg_color),
+        color::Fg(args.hint_fg_color),
+        color::Fg(color::Reset),
+        color::Bg(color::Reset),
+      )?;
 
-        print!(
-          "{goto}{background}{foregroud}{text}{resetf}{resetb}",
-          goto = cursor::Goto(final_position as u16 + 1, mat.y as u16 + 1),
-          foregroud = color::Fg(&*self.hint_foreground_color),
-          background = color::Bg(&*self.hint_background_color),
-          resetf = color::Fg(color::Reset),
-          resetb = color::Bg(color::Reset),
-          text = &text
-        );
-
-        if hint.starts_with(typed_hint) {
-          print!(
-            "{goto}{background}{foregroud}{text}{resetf}{resetb}",
-            goto = cursor::Goto(final_position as u16 + 1, mat.y as u16 + 1),
-            foregroud = color::Fg(&*self.multi_foreground_color),
-            background = color::Bg(&*self.multi_background_color),
-            resetf = color::Fg(color::Reset),
-            resetb = color::Bg(color::Reset),
-            text = &typed_hint
-          );
-        }
+      if hint.starts_with(typed_hint) {
+        write!(
+          out,
+          "{goto}{}{}{typed_hint}{}{}",
+          color::Bg(args.multi_bg_color),
+          color::Fg(args.multi_fg_color),
+          color::Fg(color::Reset),
+          color::Bg(color::Reset),
+        )?;
       }
     }
 
-    stdout.flush().unwrap();
+    out.flush()
   }
 
-  fn listen(&mut self, stdin: &mut dyn Read, stdout: &mut dyn Write) -> CaptureEvent {
+  /// Reads keys until the user picks (`true`) or gives up (`false`).
+  fn listen(&mut self, keys: impl Iterator<Item = io::Result<Key>>, out: &mut impl Write) -> io::Result<bool> {
     if self.matches.is_empty() {
-      return CaptureEvent::Exit;
+      return Ok(false);
     }
 
-    let mut typed_hint: String = "".to_owned();
     let longest_hint = self
       .matches
       .iter()
-      .filter_map(|m| m.hint.clone())
-      .max_by(|x, y| x.len().cmp(&y.len()))
-      .unwrap()
-      .clone();
+      .filter_map(|m| m.hint.as_ref())
+      .map(String::len)
+      .max();
+    let mut typed_hint = String::new();
 
-    self.render(stdout, &typed_hint);
+    self.render(out, &typed_hint)?;
 
-    loop {
-      match stdin.keys().next() {
-        Some(key) => {
-          match key {
-            Ok(key) => {
-              match key {
-                Key::Esc => {
-                  if self.multi && !typed_hint.is_empty() {
-                    typed_hint.clear();
-                  } else {
-                    break;
-                  }
-                }
-                Key::Up => {
-                  self.prev();
-                }
-                Key::Down => {
-                  self.next();
-                }
-                Key::Left => {
-                  self.prev();
-                }
-                Key::Right => {
-                  self.next();
-                }
-                Key::Backspace => {
-                  typed_hint.pop();
-                }
-                Key::Char(ch) => {
-                  match ch {
-                    '\n' => match self.matches.iter().enumerate().find(|&h| h.0 == self.skip) {
-                      Some(hm) => {
-                        self.chosen.push((hm.1.text.to_string(), false));
-
-                        if !self.multi {
-                          return CaptureEvent::Hint;
-                        }
-                      }
-                      _ => panic!("Match not found?"),
-                    },
-                    ' ' => {
-                      if self.multi {
-                        // Finalize the multi selection
-                        return CaptureEvent::Hint;
-                      } else {
-                        // Enable the multi selection
-                        self.multi = true;
-                      }
-                    }
-                    key => {
-                      let key = key.to_string();
-                      let lower_key = key.to_lowercase();
-
-                      typed_hint.push_str(lower_key.as_str());
-
-                      let selection = self.matches.iter().find(|mat| mat.hint == Some(typed_hint.clone()));
-
-                      match selection {
-                        Some(mat) => {
-                          self.chosen.push((mat.text.to_string(), key != lower_key));
-
-                          if self.multi {
-                            typed_hint.clear();
-                          } else {
-                            return CaptureEvent::Hint;
-                          }
-                        }
-                        None => {
-                          if !self.multi && typed_hint.len() >= longest_hint.len() {
-                            break;
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-                _ => {
-                  // Unknown key
-                }
-              }
-            }
-            Err(err) => panic!("{}", err),
+    for key in keys {
+      match key? {
+        Key::Esc if self.multi && !typed_hint.is_empty() => typed_hint.clear(),
+        Key::Esc => return Ok(false),
+        Key::Up | Key::Left => self.prev(),
+        Key::Down | Key::Right => self.next(),
+        Key::Backspace => {
+          typed_hint.pop();
+        }
+        Key::Char('\n') => {
+          self.chosen.push((self.matches[self.skip].text.to_string(), false));
+          if !self.multi {
+            return Ok(true);
           }
+        }
+        // Space starts the multi selection, the second space ends it.
+        Key::Char(' ') if self.multi => return Ok(true),
+        Key::Char(' ') => self.multi = true,
+        Key::Char(key) => {
+          let lower = key.to_lowercase().to_string();
+          typed_hint.push_str(&lower);
 
-          stdin.keys().for_each(|_| { /* Skip the rest of stdin buffer */ })
+          if let Some(m) = self.matches.iter().find(|m| m.hint.as_ref() == Some(&typed_hint)) {
+            self.chosen.push((m.text.to_string(), key.to_string() != lower));
+            if !self.multi {
+              return Ok(true);
+            }
+            typed_hint.clear();
+          } else if !self.multi && Some(typed_hint.len()) >= longest_hint {
+            return Ok(false);
+          }
         }
-        _ => {
-          // Nothing in the buffer. Wait for a bit...
-          std::thread::sleep(std::time::Duration::from_millis(50));
-          continue; // don't render again if nothing new to show
-        }
+        _ => {}
       }
 
-      self.render(stdout, &typed_hint);
+      self.render(out, &typed_hint)?;
     }
 
-    CaptureEvent::Exit
+    // The terminal closed.
+    Ok(false)
   }
 
-  pub fn present(&mut self) -> Vec<(String, bool)> {
-    let mut stdin = async_stdin();
-    let mut stdout = AlternateScreen::from(stdout().into_raw_mode().unwrap());
+  /// Shows the hints on the alternate screen. Returns the picked texts with their upcase flag.
+  pub fn present(mut self) -> io::Result<Vec<(String, bool)>> {
+    // stdin holds the captured text, so the keys come from the terminal.
+    let keys = termion::get_tty()?.keys();
+    let mut out = stdout().into_raw_mode()?.into_alternate_screen()?;
 
-    let hints = match self.listen(&mut stdin, &mut stdout) {
-      CaptureEvent::Exit => vec![],
-      CaptureEvent::Hint => self.chosen.clone(),
-    };
+    let picked = self.listen(keys, &mut out)?;
+    write!(out, "{}", cursor::Show)?;
 
-    write!(stdout, "{}", cursor::Show).unwrap();
+    Ok(if picked { self.chosen } else { vec![] })
+  }
+}
 
-    hints
+fn hint_text(hint: &str, contrast: bool) -> String {
+  if contrast {
+    format!("[{hint}]")
+  } else {
+    hint.to_string()
   }
 }
 
@@ -311,9 +224,12 @@ const NO_UNDERLINE: &str = "\x1b[24;59m";
 
 /// Dotted underline (`4:4`, like URLs in foot) in `color` (SGR 58). termion has neither, so reuse its
 /// foreground escape for the color.
-fn underline(color: &dyn color::Color) -> String {
+fn underline(color: Color) -> String {
   let foreground = color::Fg(color).to_string();
-  format!("\x1b[4:4m{}", foreground.replace("[38;", "[58;").replace("[39m", "[59m"))
+  format!(
+    "\x1b[4:4m{}",
+    foreground.replace("[38;", "[58;").replace("[39m", "[59m")
+  )
 }
 
 /// Prints `raw` (a captured line with escapes) and underlines `marks`: plain text byte ranges with their
@@ -326,15 +242,15 @@ fn underline_ranges(raw: &str, marks: &[(usize, usize, String)]) -> String {
 
   for token in state::tokens(raw) {
     match token {
-      state::Token::Escape(escape) => {
+      Token::Escape(escape) => {
         out.push_str(escape);
         // An SGR inside the match (for example a reset) can drop the underline.
         if let (Some(mark), Some(_)) = (open, state::sgr(escape)) {
           out.push_str(&mark.2);
         }
       }
-      state::Token::Char(c) => {
-        if open.map_or(false, |mark| mark.1 == position) {
+      Token::Char(c) => {
+        if open.is_some_and(|mark| mark.1 == position) {
           out.push_str(NO_UNDERLINE);
           open = None;
         }
@@ -356,37 +272,41 @@ fn underline_ranges(raw: &str, marks: &[(usize, usize, String)]) -> String {
 mod tests {
   use super::*;
 
-  fn split(output: &str) -> Vec<&str> {
-    output.split("\n").collect::<Vec<&str>>()
+  fn pick(input: &[u8]) -> (bool, Vec<(String, bool)>) {
+    use clap::Parser;
+    let args = Args::parse_from(["thumbs", "--alphabet", "abcd"]);
+    let lines = ["1000 1001 1002 1003 1004 1005"];
+    let matches = state::State::new(&lines, args.alphabet, &args.regexp).matches(false, false);
+    let mut view = View::new(&lines, &lines, matches, &args);
+
+    let picked = view.listen(input.keys(), &mut Vec::new()).unwrap();
+    (picked, view.chosen)
   }
 
   #[test]
-  fn hint_text() {
-    let lines = split("lorem 127.0.0.1 lorem");
-    let custom = [].to_vec();
-    let mut state = state::State::new(&lines, "abcd", &custom);
-    let mut view = View {
-      state: &mut state,
-      skip: 0,
-      multi: false,
-      contrast: false,
-      position: &"",
-      matches: vec![],
-      select_foreground_color: colors::get_color("default"),
-      multi_foreground_color: colors::get_color("default"),
-      multi_background_color: colors::get_color("default"),
-      foreground_color: colors::get_color("default"),
-      hint_background_color: colors::get_color("default"),
-      hint_foreground_color: colors::get_color("default"),
-      chosen: vec![],
-    };
+  fn keys_typed_at_once_all_count() {
+    // Hints: a, b, c, da, db, dc. Both keys come in one read.
+    assert_eq!(pick(b"dB"), (true, vec![("1004".to_string(), true)]));
+  }
 
-    let result = view.make_hint_text("a");
-    assert_eq!(result, "a".to_string());
+  #[test]
+  fn escape_and_wrong_hint_give_up() {
+    assert_eq!(pick(b"\x1b"), (false, vec![]));
+    assert_eq!(pick(b"dd"), (false, vec![]));
+  }
 
-    view.contrast = true;
-    let result = view.make_hint_text("a");
-    assert_eq!(result, "[a]".to_string());
+  #[test]
+  fn multi_selection() {
+    assert_eq!(
+      pick(b" aC "),
+      (true, vec![("1000".to_string(), false), ("1002".to_string(), true)])
+    );
+  }
+
+  #[test]
+  fn hint_text_contrast() {
+    assert_eq!(hint_text("a", false), "a");
+    assert_eq!(hint_text("a", true), "[a]");
   }
 
   #[test]

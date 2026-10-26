@@ -423,35 +423,47 @@ cargo install thumbs
 And those are all available options:
 
 ```
-thumbs 0.7.1
 A lightning fast version copy/pasting like vimium/vimperator
 
-USAGE:
-    thumbs [FLAGS] [OPTIONS]
+Usage: thumbs [OPTIONS]
 
-FLAGS:
-    -c, --contrast    Put square brackets around hint for visibility
-    -h, --help        Prints help information
-    -m, --multi       Enable multi-selection
-    -r, --reverse     Reverse the order for assigned hints
-    -u, --unique      Don't show duplicated hints for the same match
-    -V, --version     Prints version information
-
-OPTIONS:
-    -a, --alphabet <alphabet>                          Sets the alphabet [default: qwerty]
-        --fg-color <foreground_color>                  Sets the underline color for matches [default: green]
-    -f, --format <format>
-            Specifies the out format for the picked hint. (%U: Upcase, %H: Hint) [default: %H]
-
-        --hint-bg-color <hint_background_color>        Sets the background color for hints [default: black]
-        --hint-fg-color <hint_foreground_color>        Sets the foregroud color for hints [default: yellow]
-    -p, --position <position>                          Hint position [default: left]
-    -x, --regexp <regexp>...                           Use this regexp as extra pattern to match
-        --select-fg-color <select_foreground_color>    Sets the underline color for the selected match [default: blue]
-        --multi-bg-color <multi_background_color>      Sets the background color for a multi selected item [default: black]
-        --multi-fg-color <multi_foreground_color>      Sets the foreground color for a multi selected item [default: cyan]
-    -t, --target <target>                              Stores the hint in the specified path
-        --span-color <span_color>                      Also match text drawn in these foreground colors (#rrggbb, comma separated)
+Options:
+  -a, --alphabet <ALPHABET>
+          Sets the alphabet [default: qwerty]
+  -f, --format <FORMAT>
+          Specifies the out format for the picked hint. (%U: Upcase, %H: Hint) [default: %H]
+      --fg-color <FG_COLOR>
+          Sets the underline color for matches [default: green]
+      --hint-fg-color <HINT_FG_COLOR>
+          Sets the foreground color for hints [default: yellow]
+      --hint-bg-color <HINT_BG_COLOR>
+          Sets the background color for hints [default: black]
+      --multi-fg-color <MULTI_FG_COLOR>
+          Sets the foreground color for a multi selected item [default: yellow]
+      --multi-bg-color <MULTI_BG_COLOR>
+          Sets the background color for a multi selected item [default: black]
+      --select-fg-color <SELECT_FG_COLOR>
+          Sets the underline color for the selected match [default: blue]
+  -m, --multi
+          Enable multi-selection
+  -r, --reverse
+          Reverse the order for assigned hints
+  -u, --unique
+          Don't show duplicated hints for the same match
+  -p, --position <POSITION>
+          Hint position [default: left] [possible values: left, right, off_left, off_right]
+  -x, --regexp <REGEXP>
+          Use this regexp as extra pattern to match
+      --span-color <SPAN_COLOR>
+          Also match text drawn in these foreground colors (#rrggbb, comma separated), input from capture-pane -e
+  -c, --contrast
+          Put square brackets around hint for visibility
+  -t, --target <TARGET>
+          Stores the hint in the specified path
+  -h, --help
+          Print help
+  -V, --version
+          Print version
 ```
 
 

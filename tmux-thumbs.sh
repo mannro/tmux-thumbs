@@ -7,7 +7,7 @@ RELEASE_DIR="${CURRENT_DIR}/target/release"
 
 THUMBS_BINARY="${RELEASE_DIR}/thumbs"
 TMUX_THUMBS_BINARY="${RELEASE_DIR}/tmux-thumbs"
-VERSION=$(grep 'version =' "${CURRENT_DIR}/Cargo.toml" | grep -o "\".*\"" | sed 's/"//g')
+VERSION=$(grep '^version =' "${CURRENT_DIR}/Cargo.toml" | grep -o "\".*\"" | sed 's/"//g')
 
 if [ ! -f "$THUMBS_BINARY" ]; then
   tmux split-window "cd ${CURRENT_DIR} && bash ./tmux-thumbs-install.sh"
@@ -18,7 +18,7 @@ elif [[ $(${THUMBS_BINARY} --version) != "thumbs ${VERSION}"  ]]; then
 fi
 
 function get-opt-value() {
-  tmux show -vg "@thumbs-${1}" 2> /dev/null
+  tmux show -gqv "@thumbs-${1}"
 }
 
 function get-opt-arg() {

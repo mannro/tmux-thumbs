@@ -1,231 +1,224 @@
-extern crate clap;
-
-use self::clap::{App, Arg};
-use clap::crate_version;
-use regex::Regex;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use clap::Parser;
+use std::env;
+use std::fs;
 use std::io::Write;
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::os::unix::fs::DirBuilderExt;
+use std::path::PathBuf;
+use std::process::{self, Command};
+use std::time::Duration;
+
+/// `@thumbs-*` tmux options passed to `thumbs` as flags.
+const BOOLEAN_PARAMS: &[&str] = &["reverse", "unique", "contrast"];
+const STRING_PARAMS: &[&str] = &[
+  "alphabet",
+  "position",
+  "fg-color",
+  "hint-bg-color",
+  "hint-fg-color",
+  "select-fg-color",
+  "multi-fg-color",
+  "multi-bg-color",
+  "span-color",
+];
+
+/// The active pane: id, copy mode, height, scroll position, zoom.
+const PANE_FORMAT: &str = "#{pane_id}:#{?pane_in_mode,1,0}:#{pane_height}:#{scroll_position}:#{window_zoomed_flag}";
+
+#[derive(Parser)]
+#[command(
+  name = "tmux-thumbs",
+  version,
+  about = "A lightning fast version of tmux-fingers, copy/pasting tmux like vimium/vimperator"
+)]
+struct Args {
+  /// Directory where to execute thumbs
+  #[arg(long)]
+  dir: String,
+
+  /// Command to execute after choose a hint
+  #[arg(
+    long,
+    default_value = "tmux set-buffer -- \"{}\" && tmux display-message \"Copied {}\""
+  )]
+  command: String,
+
+  /// Command to execute after choose a hint, in upcase
+  #[arg(
+    long,
+    default_value = "tmux set-buffer -- \"{}\" && tmux paste-buffer && tmux display-message \"Copied {}\""
+  )]
+  upcase_command: String,
+
+  /// Command to execute after choose multiple hints
+  #[arg(
+    long,
+    default_value = "tmux set-buffer -- \"{}\" && tmux paste-buffer && tmux display-message \"Multi copied {}\""
+  )]
+  multi_command: String,
+
+  /// Print OSC52 copy escape sequence in addition to running the pick command
+  #[arg(short, long)]
+  osc52: bool,
+}
 
 trait Executor {
-  fn execute(&mut self, args: Vec<String>) -> String;
-  fn last_executed(&self) -> Option<Vec<String>>;
+  /// Runs `args` and returns its stdout without trailing whitespace.
+  fn execute(&mut self, args: &[&str]) -> String;
 }
 
-struct RealShell {
-  executed: Option<Vec<String>>,
-}
-
-impl RealShell {
-  fn new() -> RealShell {
-    RealShell { executed: None }
-  }
-}
+struct RealShell;
 
 impl Executor for RealShell {
-  fn execute(&mut self, args: Vec<String>) -> String {
-    let execution = Command::new(args[0].as_str())
+  fn execute(&mut self, args: &[&str]) -> String {
+    let output = Command::new(args[0])
       .args(&args[1..])
       .output()
       .expect("Couldn't run it");
-
-    self.executed = Some(args);
-
-    let output: String = String::from_utf8_lossy(&execution.stdout).into();
-
-    output.trim_end().to_string()
-  }
-
-  fn last_executed(&self) -> Option<Vec<String>> {
-    self.executed.clone()
+    String::from_utf8_lossy(&output.stdout).trim_end().to_string()
   }
 }
 
-const TMP_FILE: &str = "/tmp/thumbs-last";
-
-#[allow(dead_code)]
-fn dbg(msg: &str) {
-  let mut file = std::fs::OpenOptions::new()
-    .create(true)
-    .write(true)
-    .append(true)
-    .open("/tmp/thumbs.log")
-    .expect("Unable to open log file");
-
-  writeln!(&mut file, "{}", msg).expect("Unable to write log file");
+struct ActivePane {
+  id: String,
+  height: i32,
+  /// Set when the pane is in copy mode.
+  scroll_position: Option<i32>,
+  zoomed: bool,
 }
 
-pub struct Swapper<'a> {
-  executor: Box<&'a mut dyn Executor>,
-  dir: String,
-  command: String,
-  upcase_command: String,
-  multi_command: String,
-  osc52: bool,
-  active_pane_id: Option<String>,
-  active_pane_height: Option<i32>,
-  active_pane_scroll_position: Option<i32>,
-  active_pane_zoomed: Option<bool>,
-  thumbs_pane_id: Option<String>,
-  content: Option<String>,
+struct Swapper<'a> {
+  executor: &'a mut dyn Executor,
+  args: Args,
+  /// Unique per run, so two runs at the same time do not mix their picks.
   signal: String,
+  /// Private (0700) dir of this run for the files of `thumbs`: `picks` and `errors`.
+  dir: PathBuf,
 }
 
 impl<'a> Swapper<'a> {
-  fn new(
-    executor: Box<&'a mut dyn Executor>,
-    dir: String,
-    command: String,
-    upcase_command: String,
-    multi_command: String,
-    osc52: bool,
-  ) -> Swapper {
-    let since_the_epoch = SystemTime::now()
-      .duration_since(UNIX_EPOCH)
-      .expect("Time went backwards");
-    let signal = format!("thumbs-finished-{}", since_the_epoch.as_secs());
+  fn new(executor: &'a mut dyn Executor, args: Args) -> Self {
+    let base = env::var_os("XDG_RUNTIME_DIR").map_or_else(env::temp_dir, PathBuf::from);
+    let id = process::id();
 
     Swapper {
       executor,
-      dir,
-      command,
-      upcase_command,
-      multi_command,
-      osc52,
-      active_pane_id: None,
-      active_pane_height: None,
-      active_pane_scroll_position: None,
-      active_pane_zoomed: None,
-      thumbs_pane_id: None,
-      content: None,
-      signal,
+      args,
+      signal: format!("thumbs-finished-{id}"),
+      dir: base.join(format!("tmux-thumbs-{id}")),
     }
   }
 
-  pub fn capture_active_pane(&mut self) {
-    let active_command = vec![
-      "tmux",
-      "list-panes",
-      "-F",
-      "#{pane_id}:#{?pane_in_mode,1,0}:#{pane_height}:#{scroll_position}:#{window_zoomed_flag}:#{?pane_active,active,nope}",
-    ];
+  /// Runs `thumbs` in a new window, swaps it with the active pane, then runs the command for the pick.
+  fn run(&mut self) {
+    // A crashed run with the same pid can leave the dir. `remove_dir_all` does not follow symlinks, and
+    // `create` fails on a dir that someone else made.
+    let _ = fs::remove_dir_all(&self.dir);
+    fs::DirBuilder::new()
+      .mode(0o700)
+      .create(&self.dir)
+      .expect("Unable to create the thumbs dir");
 
-    let output = self
+    let (pane, thumbs_args) = self.query();
+    let thumbs_pane_id = self.execute_thumbs(&pane, &thumbs_args);
+
+    self
       .executor
-      .execute(active_command.iter().map(|arg| arg.to_string()).collect());
+      .execute(&["tmux", "swap-pane", "-d", "-s", &pane.id, "-t", &thumbs_pane_id]);
+    if pane.zoomed {
+      self
+        .executor
+        .execute(&["tmux", "resize-pane", "-t", &thumbs_pane_id, "-Z"]);
+    }
+    self.executor.execute(&["tmux", "wait-for", &self.signal]);
 
-    let lines: Vec<&str> = output.split('\n').collect();
-    let chunks: Vec<Vec<&str>> = lines.into_iter().map(|line| line.split(':').collect()).collect();
+    // No file: the user picked nothing.
+    let picks = fs::read_to_string(self.dir.join("picks")).unwrap_or_default();
+    let errors = fs::read_to_string(self.dir.join("errors")).unwrap_or_default();
+    let _ = fs::remove_dir_all(&self.dir);
 
-    let active_pane = chunks
-      .iter()
-      .find(|&chunks| *chunks.get(5).unwrap() == "active")
-      .expect("Unable to find active pane");
-
-    let pane_id = active_pane.get(0).unwrap();
-
-    self.active_pane_id = Some(pane_id.to_string());
-
-    let pane_height = active_pane
-      .get(2)
-      .unwrap()
-      .parse()
-      .expect("Unable to retrieve pane height");
-
-    self.active_pane_height = Some(pane_height);
-
-    if active_pane.get(1).unwrap().to_string() == "1" {
-      let pane_scroll_position = active_pane
-        .get(3)
-        .unwrap()
-        .parse()
-        .expect("Unable to retrieve pane scroll");
-
-      self.active_pane_scroll_position = Some(pane_scroll_position);
+    // The thumbs window is gone, so show its error (for example a bad @thumbs-* option) in tmux.
+    if let Some(error) = errors.lines().find(|line| !line.trim().is_empty()) {
+      let message = format!("tmux-thumbs: {}", error.replace('#', "##"));
+      self.executor.execute(&["tmux", "display-message", &message]);
     }
 
-    let zoomed_pane = *active_pane.get(4).expect("Unable to retrieve zoom pane property") == "1";
-
-    self.active_pane_zoomed = Some(zoomed_pane);
+    self.execute_command(picks.trim_end());
   }
 
-  pub fn execute_thumbs(&mut self) {
-    let options_command = vec!["tmux", "show", "-g"];
-    let params: Vec<String> = options_command.iter().map(|arg| arg.to_string()).collect();
-    let options = self.executor.execute(params);
-    let lines: Vec<&str> = options.split('\n').collect();
+  /// Reads the active pane and the `@thumbs-*` options as `thumbs` flags. Each tmux call costs about
+  /// 15 ms, so this makes two: `show -g` for the option names, then one `display -p` for the rest.
+  fn query(&mut self) -> (ActivePane, Vec<String>) {
+    // `show -g` escapes the values, so it only gives the names.
+    let options = self.executor.execute(&["tmux", "show", "-g"]);
+    let names = options
+      .lines()
+      .filter_map(|line| line.split_whitespace().next()?.strip_prefix("@thumbs-"))
+      .filter(|name| BOOLEAN_PARAMS.contains(name) || STRING_PARAMS.contains(name) || name.starts_with("regexp"))
+      .collect::<Vec<_>>();
 
-    let pattern = Regex::new(r#"^@thumbs-([\w\-0-9]+)\s+"?([^"]+)"?$"#).unwrap();
+    // `display -p` gives raw values. `\x1f` separates them, it does not come up in a value.
+    let format = std::iter::once(PANE_FORMAT.to_string())
+      .chain(
+        names
+          .iter()
+          .filter(|name| !BOOLEAN_PARAMS.contains(name))
+          .map(|name| format!("#{{@thumbs-{name}}}")),
+      )
+      .collect::<Vec<_>>()
+      .join("\x1f");
+    let output = self.executor.execute(&["tmux", "display-message", "-p", &format]);
+    let mut values = output.split('\x1f');
 
-    let args = lines
+    let fields = values.next().unwrap_or_default();
+    let [id, in_mode, height, scroll, zoomed] = fields.split(':').collect::<Vec<_>>()[..] else {
+      panic!("Unexpected pane info: {fields:?}");
+    };
+    let pane = ActivePane {
+      id: id.to_string(),
+      height: height.parse().expect("Unable to retrieve pane height"),
+      scroll_position: (in_mode == "1").then(|| scroll.parse().expect("Unable to retrieve pane scroll")),
+      zoomed: zoomed == "1",
+    };
+
+    let args = names
       .iter()
-      .flat_map(|line| {
-        if let Some(captures) = pattern.captures(line) {
-          let name = captures.get(1).unwrap().as_str();
-          let value = captures.get(2).unwrap().as_str();
-
-          let boolean_params = vec!["reverse", "unique", "contrast"];
-
-          if boolean_params.iter().any(|&x| x == name) {
-            return vec![format!("--{}", name)];
-          }
-
-          let string_params = vec![
-            "alphabet",
-            "position",
-            "fg-color",
-            "hint-bg-color",
-            "hint-fg-color",
-            "select-fg-color",
-            "multi-fg-color",
-            "multi-bg-color",
-            "span-color",
-          ];
-
-          if string_params.iter().any(|&x| x == name) {
-            return vec![format!("--{}", name), format!("'{}'", value)];
-          }
-
-          if name.starts_with("regexp") {
-            return vec!["--regexp".to_string(), format!("'{}'", value.replace("\\\\", "\\"))];
-          }
-
-          vec![]
-        } else {
-          vec![]
+      .map(|&name| {
+        if BOOLEAN_PARAMS.contains(&name) {
+          return format!("--{name}");
         }
+        let flag = if name.starts_with("regexp") { "regexp" } else { name };
+        format!("--{flag}={}", quote(values.next().unwrap_or_default()))
       })
-      .collect::<Vec<String>>();
+      .collect();
 
-    let active_pane_id = self.active_pane_id.as_mut().unwrap().clone();
+    (pane, args)
+  }
 
-    let scroll_params =
-      if let (Some(pane_height), Some(scroll_position)) = (self.active_pane_height, self.active_pane_scroll_position) {
-        format!(" -S {} -E {}", -scroll_position, pane_height - scroll_position - 1)
-      } else {
-        "".to_string()
-      };
-
-    let active_pane_zoomed = self.active_pane_zoomed.as_mut().unwrap().clone();
-    let zoom_command = if active_pane_zoomed {
-      format!("tmux resize-pane -t {} -Z;", active_pane_id)
+  /// Starts `thumbs` in a new hidden window. Returns the id of its pane.
+  fn execute_thumbs(&mut self, pane: &ActivePane, args: &[String]) -> String {
+    let id = &pane.id;
+    let scroll_params = pane.scroll_position.map_or(String::new(), |scroll| {
+      format!(" -S {} -E {}", -scroll, pane.height - scroll - 1)
+    });
+    let zoom_command = if pane.zoomed {
+      format!("tmux resize-pane -t {id} -Z;")
     } else {
-      "".to_string()
+      String::new()
     };
 
     let pane_command = format!(
-        "tmux capture-pane -J -e -t {active_pane_id} -p{scroll_params} | tail -n {height} | {dir}/target/release/thumbs -f '%U:%H' -t {tmp} {args}; tmux swap-pane -t {active_pane_id}; {zoom_command} tmux wait-for -S {signal}",
-        active_pane_id = active_pane_id,
-        scroll_params = scroll_params,
-        height = self.active_pane_height.unwrap_or(i32::MAX),
-        dir = self.dir,
-        tmp = TMP_FILE,
-        args = args.join(" "),
-        zoom_command = zoom_command,
-        signal = self.signal
+      "tmux capture-pane -J -e -t {id} -p{scroll_params} | tail -n {height} | {thumbs} -f '%U:%H' -t {picks} {args} 2> {errors}; tmux swap-pane -t {id}; {zoom_command} tmux wait-for -S {signal}",
+      height = pane.height,
+      thumbs = quote(&format!("{}/target/release/thumbs", self.args.dir)),
+      picks = quote(&self.dir.join("picks").to_string_lossy()),
+      errors = quote(&self.dir.join("errors").to_string_lossy()),
+      args = args.join(" "),
+      signal = self.signal,
     );
 
-    let thumbs_command = vec![
+    self.executor.execute(&[
       "tmux",
       "new-window",
       "-P",
@@ -234,180 +227,91 @@ impl<'a> Swapper<'a> {
       "-d",
       "-n",
       "[thumbs]",
-      pane_command.as_str(),
-    ];
-
-    let params: Vec<String> = thumbs_command.iter().map(|arg| arg.to_string()).collect();
-
-    self.thumbs_pane_id = Some(self.executor.execute(params));
+      &pane_command,
+    ])
   }
 
-  pub fn swap_panes(&mut self) {
-    let active_pane_id = self.active_pane_id.as_mut().unwrap().clone();
-    let thumbs_pane_id = self.thumbs_pane_id.as_mut().unwrap().clone();
+  /// Runs the user command for `content`: `thumbs` output, one `upcase:text` line per pick.
+  fn execute_command(&mut self, content: &str) {
+    let items = content.split('\n').collect::<Vec<_>>();
 
-    let swap_command = vec![
-      "tmux",
-      "swap-pane",
-      "-d",
-      "-s",
-      active_pane_id.as_str(),
-      "-t",
-      thumbs_pane_id.as_str(),
-    ];
-
-    let params = swap_command
-      .iter()
-      .filter(|&s| !s.is_empty())
-      .map(|arg| arg.to_string())
-      .collect();
-
-    self.executor.execute(params);
-  }
-
-  pub fn resize_pane(&mut self) {
-    let active_pane_zoomed = self.active_pane_zoomed.as_mut().unwrap().clone();
-
-    if !active_pane_zoomed {
-      return;
-    }
-
-    let thumbs_pane_id = self.thumbs_pane_id.as_mut().unwrap().clone();
-
-    let resize_command = vec!["tmux", "resize-pane", "-t", thumbs_pane_id.as_str(), "-Z"];
-
-    let params = resize_command
-      .iter()
-      .filter(|&s| !s.is_empty())
-      .map(|arg| arg.to_string())
-      .collect();
-
-    self.executor.execute(params);
-  }
-
-  pub fn wait_thumbs(&mut self) {
-    let wait_command = vec!["tmux", "wait-for", self.signal.as_str()];
-    let params = wait_command.iter().map(|arg| arg.to_string()).collect();
-
-    self.executor.execute(params);
-  }
-
-  pub fn retrieve_content(&mut self) {
-    let retrieve_command = vec!["cat", TMP_FILE];
-    let params = retrieve_command.iter().map(|arg| arg.to_string()).collect();
-
-    self.content = Some(self.executor.execute(params));
-  }
-
-  pub fn destroy_content(&mut self) {
-    let retrieve_command = vec!["rm", TMP_FILE];
-    let params = retrieve_command.iter().map(|arg| arg.to_string()).collect();
-
-    self.executor.execute(params);
-  }
-
-  pub fn send_osc52(&mut self) {}
-
-  pub fn execute_command(&mut self) {
-    let content = self.content.clone().unwrap();
-    let items: Vec<&str> = content.split('\n').collect();
-
-    if items.len() > 1 {
+    let [item] = items[..] else {
       let text = items
         .iter()
-        .map(|item| item.splitn(2, ':').last().unwrap())
-        .collect::<Vec<&str>>()
+        .map(|item| item.split_once(':').map_or(*item, |(_, text)| text))
+        .collect::<Vec<_>>()
         .join(" ");
-
-      self.execute_final_command(&text, &self.multi_command.clone());
-
+      let command = self.args.multi_command.clone();
+      self.execute_final_command(&text, &command);
       return;
+    };
+
+    let Some((upcase, text)) = item.split_once(':') else {
+      return;
+    };
+
+    if self.args.osc52 {
+      let osc = format!("\x1b]52;0;{}\x07", STANDARD.encode(text));
+      let tmux_seq = format!("\x1bPtmux;{}\x1b\\", osc.replace('\x1b', "\x1b\x1b"));
+
+      // `thumbs` left the alternate screen, so tmux redraws the pane. tmux drops the sequence when it
+      // comes before the redraw ends (`tty_client_ready` is false), so wait a little bit.
+      std::thread::sleep(Duration::from_millis(100));
+
+      let mut stdout = std::io::stdout();
+      stdout.write_all(tmux_seq.as_bytes()).unwrap();
+      stdout.flush().unwrap();
     }
 
-    // Only one item
-    let item: &str = items.first().unwrap();
-
-    let mut splitter = item.splitn(2, ':');
-
-    if let Some(upcase) = splitter.next() {
-      if let Some(text) = splitter.next() {
-        if self.osc52 {
-          let base64_text = base64::encode(text.as_bytes());
-          let osc_seq = format!("\x1b]52;0;{}\x07", base64_text);
-          let tmux_seq = format!("\x1bPtmux;{}\x1b\\", osc_seq.replace("\x1b", "\x1b\x1b"));
-
-          // FIXME: Review if this comment is still rellevant
-          //
-          // When the user selects a match:
-          // 1. The `rustbox` object created in the `viewbox` above is dropped.
-          // 2. During its `drop`, the `rustbox` object sends a CSI 1049 escape
-          //    sequence to tmux.
-          // 3. This escape sequence causes the `window_pane_alternate_off` function
-          //    in tmux to be called.
-          // 4. In `window_pane_alternate_off`, tmux sets the needs-redraw flag in the
-          //    pane.
-          // 5. If we print the OSC copy escape sequence before the redraw is completed,
-          //    tmux will *not* send the sequence to the host terminal. See the following
-          //    call chain in tmux: `input_dcs_dispatch` -> `screen_write_rawstring`
-          //    -> `tty_write` -> `tty_client_ready`. In this case, `tty_client_ready`
-          //    will return false, thus preventing the escape sequence from being sent.
-          //
-          // Therefore, for now we wait a little bit here for the redraw to finish.
-          std::thread::sleep(std::time::Duration::from_millis(100));
-
-          std::io::stdout().write_all(tmux_seq.as_bytes()).unwrap();
-          std::io::stdout().flush().unwrap();
-        }
-
-        let execute_command = if upcase.trim_end() == "true" {
-          self.upcase_command.clone()
-        } else {
-          self.command.clone()
-        };
-
-        // The command we run has two arguments:
-        //  * The first arg is the (trimmed) text. This gets stored in a variable, in order to
-        //    preserve quoting and special characters.
-        //
-        //  * The second argument is the user's command, with the '{}' token replaced with an
-        //    unquoted reference to the variable containing the text.
-        //
-        // The reference is unquoted, unfortunately, because the token may already have been
-        // spliced into a string (e.g 'tmux display-message "Copied {}"'), and it's impossible (or
-        // at least exceedingly difficult) to determine the correct quoting level.
-        //
-        // The alternative of literally splicing the text into the command is bad and it causes all
-        // kinds of harmful escaping issues that the user cannot reasonable avoid.
-        //
-        // For example, imagine some pattern matched the text "foo;rm *" and the user's command was
-        // an innocuous "echo {}". With literal splicing, we would run the command "echo foo;rm *".
-        // That's BAD. Without splicing, instead we execute "echo ${THUMB}" which does mostly the
-        // right thing regardless the contents of the text. (At worst, bash will word-separate the
-        // unquoted variable; but it won't _execute_ those words in common scenarios).
-        //
-        // Ideally user commands would just use "${THUMB}" to begin with rather than having any
-        // sort of ad-hoc string splicing here at all, and then they could specify the quoting they
-        // want, but that would break backwards compatibility.
-        self.execute_final_command(text.trim_end(), &execute_command);
-      }
-    }
+    let command = if upcase.trim_end() == "true" {
+      self.args.upcase_command.clone()
+    } else {
+      self.args.command.clone()
+    };
+    self.execute_final_command(text.trim_end(), &command);
   }
 
-  pub fn execute_final_command(&mut self, text: &str, execute_command: &str) {
-    let final_command = str::replace(execute_command, "{}", "${THUMB}");
-    let retrieve_command = vec![
-      "bash",
-      "-c",
-      "THUMB=\"$1\"; eval \"$2\"",
-      "--",
-      text,
-      final_command.as_str(),
-    ];
-
-    let params = retrieve_command.iter().map(|arg| arg.to_string()).collect();
-
-    self.executor.execute(params);
+  /// Runs `command` with `{}` replaced by an unquoted reference to the variable that holds `text`.
+  ///
+  /// The command we run has two arguments:
+  ///  * The first arg is the (trimmed) text. This gets stored in a variable, in order to
+  ///    preserve quoting and special characters.
+  ///
+  ///  * The second argument is the user's command, with the '{}' token replaced with an
+  ///    unquoted reference to the variable containing the text.
+  ///
+  /// The reference is unquoted, unfortunately, because the token may already have been
+  /// spliced into a string (e.g 'tmux display-message "Copied {}"'), and it's impossible (or
+  /// at least exceedingly difficult) to determine the correct quoting level.
+  ///
+  /// The alternative of literally splicing the text into the command is bad and it causes all
+  /// kinds of harmful escaping issues that the user cannot reasonable avoid.
+  ///
+  /// For example, imagine some pattern matched the text "foo;rm *" and the user's command was
+  /// an innocuous "echo {}". With literal splicing, we would run the command "echo foo;rm *".
+  /// That's BAD. Without splicing, instead we execute "echo ${THUMB}" which does mostly the
+  /// right thing regardless the contents of the text. (At worst, bash will word-separate the
+  /// unquoted variable; but it won't _execute_ those words in common scenarios).
+  ///
+  /// Ideally user commands would just use "${THUMB}" to begin with rather than having any
+  /// sort of ad-hoc string splicing here at all, and then they could specify the quoting they
+  /// want, but that would break backwards compatibility.
+  fn execute_final_command(&mut self, text: &str, command: &str) {
+    let command = command.replace("{}", "${THUMB}");
+    self
+      .executor
+      .execute(&["bash", "-c", "THUMB=\"$1\"; eval \"$2\"", "--", text, &command]);
   }
+}
+
+/// Quotes `value` as one shell word.
+fn quote(value: &str) -> String {
+  format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+fn main() {
+  let mut shell = RealShell;
+  Swapper::new(&mut shell, Args::parse()).run();
 }
 
 #[cfg(test)]
@@ -416,97 +320,74 @@ mod tests {
 
   struct TestShell {
     outputs: Vec<String>,
-    executed: Option<Vec<String>>,
+    executed: Vec<String>,
   }
 
   impl TestShell {
-    fn new(outputs: Vec<String>) -> TestShell {
+    fn new(outputs: &[&str]) -> TestShell {
       TestShell {
-        executed: None,
-        outputs,
+        outputs: outputs.iter().map(|output| output.to_string()).collect(),
+        executed: vec![],
       }
     }
   }
 
   impl Executor for TestShell {
-    fn execute(&mut self, args: Vec<String>) -> String {
-      self.executed = Some(args);
+    fn execute(&mut self, args: &[&str]) -> String {
+      self.executed = args.iter().map(|arg| arg.to_string()).collect();
       self.outputs.pop().unwrap()
     }
+  }
 
-    fn last_executed(&self) -> Option<Vec<String>> {
-      self.executed.clone()
-    }
+  fn args(extra: &[&str]) -> Args {
+    Args::parse_from(["tmux-thumbs", "--dir", "/thumbs"].iter().chain(extra))
   }
 
   #[test]
-  fn retrieve_active_pane() {
-    let last_command_outputs = vec!["%97:100:24:1:0:active\n%106:100:24:1:0:nope\n%107:100:24:1:0:nope\n".to_string()];
-    let mut executor = TestShell::new(last_command_outputs);
-    let mut swapper = Swapper::new(
-      Box::new(&mut executor),
-      "".to_string(),
-      "".to_string(),
-      "".to_string(),
-      "".to_string(),
-      false,
+  fn thumbs_window() {
+    let regexp = r#"(?:\$ |&& )(?P<match>[^"' ]+) # it's"#;
+    let mut executor = TestShell::new(&[
+      "%100",
+      &format!("%98:1:24:5:1\x1fdvorak\x1f{regexp}"),
+      "@thumbs-alphabet dvorak\n@thumbs-other x\n@thumbs-regexp-1 \"escaped\"\n@thumbs-reverse enabled\n@other x",
+    ]);
+    let mut swapper = Swapper::new(&mut executor, args(&[]));
+
+    let (pane, thumbs_args) = swapper.query();
+    assert_eq!(
+      (pane.id.as_str(), pane.height, pane.scroll_position, pane.zoomed),
+      ("%98", 24, Some(5), true)
+    );
+    assert_eq!(swapper.execute_thumbs(&pane, &thumbs_args), "%100");
+    let (signal, dir) = (swapper.signal.clone(), swapper.dir.clone());
+    let command = executor.executed.last().unwrap();
+
+    assert_eq!(
+      command,
+      &format!(
+        "tmux capture-pane -J -e -t %98 -p -S -5 -E 18 | tail -n 24 | '/thumbs/target/release/thumbs' -f '%U:%H' -t '{}' --alphabet='dvorak' --regexp='(?:\\$ |&& )(?P<match>[^\"'\\'' ]+) # it'\\''s' --reverse 2> '{}'; tmux swap-pane -t %98; tmux resize-pane -t %98 -Z; tmux wait-for -S {signal}",
+        dir.join("picks").display(),
+        dir.join("errors").display(),
+      )
     );
 
-    swapper.capture_active_pane();
-
-    assert_eq!(swapper.active_pane_id.unwrap(), "%97");
-  }
-
-  #[test]
-  fn swap_panes() {
-    let last_command_outputs = vec![
-      "".to_string(),
-      "%100".to_string(),
-      "".to_string(),
-      "%106:100:24:1:0:nope\n%98:100:24:1:0:active\n%107:100:24:1:0:nope\n".to_string(),
-    ];
-    let mut executor = TestShell::new(last_command_outputs);
-    let mut swapper = Swapper::new(
-      Box::new(&mut executor),
-      "".to_string(),
-      "".to_string(),
-      "".to_string(),
-      "".to_string(),
-      false,
-    );
-
-    swapper.capture_active_pane();
-    swapper.execute_thumbs();
-    swapper.swap_panes();
-
-    let expectation = vec!["tmux", "swap-pane", "-d", "-s", "%98", "-t", "%100"];
-
-    assert_eq!(executor.last_executed().unwrap(), expectation);
+    // The shell gives thumbs the raw value back.
+    let output = Command::new("bash")
+      .args(["-c", &format!("printf %s {}", quote(regexp))])
+      .output()
+      .unwrap();
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), regexp);
   }
 
   #[test]
   fn quoted_execution() {
-    let last_command_outputs = vec!["Blah blah blah, the ignored user script output".to_string()];
-    let mut executor = TestShell::new(last_command_outputs);
-
-    let user_command = "echo \"{}\"".to_string();
-    let upcase_command = "open \"{}\"".to_string();
-    let multi_command = "open \"{}\"".to_string();
+    let mut executor = TestShell::new(&["Blah blah blah, the ignored user script output"]);
     let mut swapper = Swapper::new(
-      Box::new(&mut executor),
-      "".to_string(),
-      user_command,
-      upcase_command,
-      multi_command,
-      false,
+      &mut executor,
+      args(&["--command", "echo \"{}\"", "--upcase-command", "open \"{}\""]),
     );
 
-    swapper.content = Some(format!(
-      "{do_upcase}:{thumb_text}",
-      do_upcase = false,
-      thumb_text = "foobar;rm *",
-    ));
-    swapper.execute_command();
+    swapper.execute_command("false:foobar;rm *");
 
     let expectation = vec![
       "bash",
@@ -523,77 +404,16 @@ mod tests {
       "echo \"${THUMB}\"",
     ];
 
-    assert_eq!(executor.last_executed().unwrap(), expectation);
-  }
-}
-
-fn app_args<'a>() -> clap::ArgMatches<'a> {
-  App::new("tmux-thumbs")
-    .version(crate_version!())
-    .about("A lightning fast version of tmux-fingers, copy/pasting tmux like vimium/vimperator")
-    .arg(
-      Arg::with_name("dir")
-        .help("Directory where to execute thumbs")
-        .long("dir")
-        .default_value(""),
-    )
-    .arg(
-      Arg::with_name("command")
-        .help("Command to execute after choose a hint")
-        .long("command")
-        .default_value("tmux set-buffer -- \"{}\" && tmux display-message \"Copied {}\""),
-    )
-    .arg(
-      Arg::with_name("upcase_command")
-        .help("Command to execute after choose a hint, in upcase")
-        .long("upcase-command")
-        .default_value("tmux set-buffer -- \"{}\" && tmux paste-buffer && tmux display-message \"Copied {}\""),
-    )
-    .arg(
-      Arg::with_name("multi_command")
-        .help("Command to execute after choose multiple hints")
-        .long("multi-command")
-        .default_value("tmux set-buffer -- \"{}\" && tmux paste-buffer && tmux display-message \"Multi copied {}\""),
-    )
-    .arg(
-      Arg::with_name("osc52")
-        .help("Print OSC52 copy escape sequence in addition to running the pick command")
-        .long("osc52")
-        .short("o"),
-    )
-    .get_matches()
-}
-
-fn main() -> std::io::Result<()> {
-  let args = app_args();
-  let dir = args.value_of("dir").unwrap();
-  let command = args.value_of("command").unwrap();
-  let upcase_command = args.value_of("upcase_command").unwrap();
-  let multi_command = args.value_of("multi_command").unwrap();
-  let osc52 = args.is_present("osc52");
-
-  if dir.is_empty() {
-    panic!("Invalid tmux-thumbs execution. Are you trying to execute tmux-thumbs directly?")
+    assert_eq!(executor.executed, expectation);
   }
 
-  let mut executor = RealShell::new();
-  let mut swapper = Swapper::new(
-    Box::new(&mut executor),
-    dir.to_string(),
-    command.to_string(),
-    upcase_command.to_string(),
-    multi_command.to_string(),
-    osc52,
-  );
+  #[test]
+  fn multi_execution() {
+    let mut executor = TestShell::new(&[""]);
+    let mut swapper = Swapper::new(&mut executor, args(&["--multi-command", "echo {}"]));
 
-  swapper.capture_active_pane();
-  swapper.execute_thumbs();
-  swapper.swap_panes();
-  swapper.resize_pane();
-  swapper.wait_thumbs();
-  swapper.retrieve_content();
-  swapper.destroy_content();
-  swapper.execute_command();
+    swapper.execute_command("false:a\ntrue:b:c");
 
-  Ok(())
+    assert_eq!(executor.executed[4], "a b:c");
+  }
 }
