@@ -56,14 +56,110 @@ impl<'a> PartialEq for Match<'a> {
 
 pub struct State<'a> {
   pub lines: &'a Vec<&'a str>,
+  /// Per line byte ranges matched by foreground color (see `parse_ansi`).
+  pub spans: Vec<Vec<(usize, usize)>>,
   alphabet: &'a str,
   regexp: &'a Vec<&'a str>,
+}
+
+/// Strips escape sequences from a `capture-pane -e` line. Returns the plain text
+/// and the byte ranges (in the plain text, whitespace trimmed) drawn in one of `colors`.
+// ponytail: only 24-bit `38;2;r;g;b` foregrounds are tracked, add 256/16 colors if a span needs them.
+pub fn parse_ansi(line: &str, colors: &[(u8, u8, u8)]) -> (String, Vec<(usize, usize)>) {
+  let mut plain = String::with_capacity(line.len());
+  let mut spans = Vec::new();
+  let mut fg: Option<(u8, u8, u8)> = None;
+  let mut start: Option<usize> = None;
+  let mut chars = line.chars().peekable();
+
+  while let Some(c) = chars.next() {
+    if c == '\x1b' {
+      match chars.next() {
+        // CSI: params until a final byte, only SGR (`m`) changes colors.
+        Some('[') => {
+          let mut seq = String::new();
+          for c in chars.by_ref() {
+            if ('@'..='~').contains(&c) {
+              if c == 'm' {
+                fg = sgr_foreground(&seq, fg);
+              }
+              break;
+            }
+            seq.push(c);
+          }
+        }
+        // OSC (hyperlinks): until BEL or ST (`ESC \`).
+        Some(']') => {
+          while let Some(c) = chars.next() {
+            if c == '\x07' || (c == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
+              break;
+            }
+          }
+        }
+        _ => {}
+      }
+      continue;
+    }
+
+    let colored = fg.map_or(false, |fg| colors.contains(&fg));
+    match start {
+      None if colored => start = Some(plain.len()),
+      Some(s) if !colored => {
+        spans.push((s, plain.len()));
+        start = None;
+      }
+      _ => {}
+    }
+    plain.push(c);
+  }
+  if let Some(s) = start {
+    spans.push((s, plain.len()));
+  }
+
+  let spans = spans
+    .into_iter()
+    .filter_map(|(s, e)| {
+      let text = &plain[s..e];
+      let trimmed = text.trim();
+      let s = s + (text.len() - text.trim_start().len());
+      (!trimmed.is_empty()).then(|| (s, s + trimmed.len()))
+    })
+    .collect();
+
+  (plain, spans)
+}
+
+fn sgr_foreground(seq: &str, fg: Option<(u8, u8, u8)>) -> Option<(u8, u8, u8)> {
+  let params: Vec<u16> = seq.split(';').map(|p| p.parse().unwrap_or(0)).collect();
+  let mut fg = fg;
+  let mut i = 0;
+
+  while i < params.len() {
+    match (params[i], params.get(i + 1)) {
+      (0 | 39 | 30..=37 | 90..=97, _) => fg = None,
+      (38, Some(2)) if params.len() > i + 4 => {
+        fg = Some((params[i + 2] as u8, params[i + 3] as u8, params[i + 4] as u8));
+        i += 4;
+      }
+      (38, Some(5)) => {
+        fg = None;
+        i += 2;
+      }
+      (48, Some(2)) => i += 4,
+      (48, Some(5)) => i += 2,
+      _ => {}
+    }
+    i += 1;
+  }
+
+  fg
 }
 
 impl<'a> State<'a> {
   pub fn new(lines: &'a Vec<&'a str>, alphabet: &'a str, regexp: &'a Vec<&'a str>) -> State<'a> {
     State {
       lines,
+      spans: Vec::new(),
       alphabet,
       regexp,
     }
@@ -150,6 +246,21 @@ impl<'a> State<'a> {
       }
     }
 
+    // A colored span (for example a command in inline code) wins over regex matches inside it.
+    for (y, spans) in self.spans.iter().enumerate() {
+      for &(start, end) in spans {
+        matches.retain(|m| !(m.y == y as i32 && (m.x as usize) < end && m.x as usize + m.text.len() > start));
+        matches.push(Match {
+          x: start as i32,
+          y: y as i32,
+          pattern: "span",
+          text: &self.lines[y][start..end],
+          hint: None,
+        });
+      }
+    }
+    matches.sort_by_key(|m| (m.y, m.x));
+
     let alphabet = super::alphabets::get_alphabet(self.alphabet);
     let mut hints = alphabet.hints(matches.len());
 
@@ -194,6 +305,23 @@ mod tests {
 
   fn split(output: &str) -> Vec<&str> {
     output.split("\n").collect::<Vec<&str>>()
+  }
+
+  #[test]
+  fn match_color_span() {
+    let raw = "run \x1b[38;2;0;255;136mchezmoi re-add ~/.bashrc\x1b[39m. or /tmp/a \x1b[38;2;1;2;3mnope\x1b[0m";
+    let (plain, spans) = parse_ansi(raw, &[(0, 255, 136)]);
+    assert_eq!(plain, "run chezmoi re-add ~/.bashrc. or /tmp/a nope");
+
+    let lines = vec![plain.as_str()];
+    let custom = [].to_vec();
+    let mut state = State::new(&lines, "abcd", &custom);
+    state.spans = vec![spans];
+    let results = state.matches(false, false);
+
+    let texts = results.iter().map(|m| m.text).collect::<Vec<_>>();
+    assert_eq!(texts, ["chezmoi re-add ~/.bashrc", "/tmp/a"]);
+    assert_eq!(results.first().unwrap().hint.clone().unwrap(), "a");
   }
 
   #[test]

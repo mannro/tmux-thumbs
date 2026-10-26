@@ -42,13 +42,14 @@ more with `--regexp` parameter.
 You can add this line to your list of [TPM](https://github.com/tmux-plugins/tpm) plugins in `.tmux.conf`:
 
 ```
-set -g @plugin 'fcsonline/tmux-thumbs'
+set -g @plugin 'mannro/tmux-thumbs'
 
 run-shell ~/.tmux/plugins/tmux-thumbs/tmux-thumbs.tmux
 ```
 
-To be able to install the plugin just hit <kbd>prefix</kbd> + <kbd>I</kbd>. You should now be able to use
-the plugin!
+To be able to install the plugin just hit <kbd>prefix</kbd> + <kbd>I</kbd>. On first use the plugin compiles
+itself with `cargo` (or `mise exec rust -- cargo`). This fork underlines matched text and adds
+[@thumbs-span-color](#thumbs-span-color), so upstream release binaries do not work with it.
 
 ## Installation checking out the source code
 
@@ -105,6 +106,7 @@ NOTE: for changes to take effect, you'll need to source again your `.tmux.conf` 
 * [@thumbs-multi-fg-color](#thumbs-multi-fg-color)
 * [@thumbs-multi-bg-color](#thumbs-multi-bg-color)
 * [@thumbs-contrast](#thumbs-contrast)
+* [@thumbs-span-color](#thumbs-span-color)
 * [@thumbs-osc52](#thumbs-osc52)
 
 ### @thumbs-key
@@ -186,6 +188,20 @@ set -g @thumbs-regexp-2 '[a-f0-9]{2}:[a-f0-9]{2}:[a-f0-9]{2}:[a-f0-9]{2}:[a-f0-9
 set -g @thumbs-regexp-3 'Vlan\d+' # match Vlan interface on network devices
 set -g @thumbs-regexp-4 "Vlan\\d+" # alternative method of defining regexp
 set -g @thumbs-regexp-5 Vlan\\d+ # alternative method of defining regexp
+```
+
+### @thumbs-span-color
+
+`default: none`
+
+Matches every run of text drawn in one of these 24-bit foreground colors (`#rrggbb`, comma separated) as one hint,
+for example a whole command shown as inline code. The span wins over regex matches inside it. When set, the
+pane is captured with `capture-pane -e`.
+
+For example:
+
+```
+set -g @thumbs-span-color '#00ff88'
 ```
 
 ### @thumbs-command

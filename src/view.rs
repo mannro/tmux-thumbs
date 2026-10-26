@@ -6,7 +6,7 @@ use termion::event::Key;
 use termion::input::TermRead;
 use termion::raw::IntoRawMode;
 use termion::screen::AlternateScreen;
-use termion::{color, cursor};
+use termion::{color, cursor, style};
 
 use unicode_width::UnicodeWidthStr;
 
@@ -131,10 +131,12 @@ impl<'a> View<'a> {
       let text = self.make_hint_text(mat.text);
 
       print!(
-        "{goto}{background}{foregroud}{text}{resetf}{resetb}",
+        "{goto}{background}{foregroud}{underline}{text}{nounderline}{resetf}{resetb}",
         goto = cursor::Goto(offset + 1, mat.y as u16 + 1),
         foregroud = color::Fg(&**selected_color),
         background = color::Bg(&**selected_background_color),
+        underline = style::Underline,
+        nounderline = style::NoUnderline,
         resetf = color::Fg(color::Reset),
         resetb = color::Bg(color::Reset),
         text = &text

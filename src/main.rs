@@ -124,6 +124,12 @@ fn app_args<'a>() -> clap::ArgMatches<'a> {
         .multiple(true),
     )
     .arg(
+      Arg::with_name("span_color")
+        .help("Also match text drawn in these foreground colors (#rrggbb, comma separated), input from capture-pane -e")
+        .long("span-color")
+        .takes_value(true),
+    )
+    .arg(
       Arg::with_name("contrast")
         .help("Put square brackets around hint for visibility")
         .long("contrast")
@@ -170,9 +176,14 @@ fn main() {
 
   handle.read_to_string(&mut output).unwrap();
 
-  let lines = output.split('\n').collect::<Vec<&str>>();
+  let span_colors = args.value_of("span_color").map_or(vec![], |colors| {
+    colors.split(',').map(parse_hex).collect::<Vec<_>>()
+  });
+  let (plain, spans): (Vec<String>, Vec<_>) = output.split('\n').map(|line| state::parse_ansi(line, &span_colors)).unzip();
+  let lines = plain.iter().map(String::as_str).collect::<Vec<&str>>();
 
   let mut state = state::State::new(&lines, alphabet, &regexp);
+  state.spans = spans;
 
   let selected = {
     let mut viewbox = view::View::new(
@@ -225,4 +236,15 @@ fn main() {
   } else {
     ::std::process::exit(1);
   }
+}
+
+fn parse_hex(color: &str) -> (u8, u8, u8) {
+  let hex = color.trim().trim_start_matches('#');
+  let byte = |i: usize| {
+    hex
+      .get(i..i + 2)
+      .and_then(|b| u8::from_str_radix(b, 16).ok())
+      .unwrap_or_else(|| panic!("Invalid span color: {}", color))
+  };
+  (byte(0), byte(2), byte(4))
 }

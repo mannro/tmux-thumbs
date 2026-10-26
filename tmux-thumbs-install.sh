@@ -51,63 +51,18 @@ fi
 
 read -rs -n 1
 
-cat << EOF
+# This fork always compiles: upstream release binaries lack the fork's options.
+if [ -x "$(command -v cargo)" ]; then
+  cargo=(cargo)
+elif [ -x "$(command -v mise)" ]; then
+  cargo=(mise exec rust -- cargo)
+else
+  echo '❌ Rust is not installed!'
+  exit 1
+fi
 
-  Which format do you prefer for installation?
-
-  1) Compile: will use cargo to compile tmux-thumbs. It requires Rust.
-  2) Download: will download a precompiled binary for your system.
-
-EOF
-
-select opt in "Compile" "Download"; do
-  case $opt in
-    Compile|1)
-
-      if ! [ -x "$(command -v cargo)" ]; then
-        echo '❌ Rust is not installed!'
-        exit 1
-      fi
-
-      echo '  Compiling tmux-thumbs, be patient:'
-      cargo build --release --target-dir=target
-
-      break;;
-    Download|2)
-      platform="$(uname -s)_$(uname -m)"
-
-      echo "  Downloading ${platform} binary..."
-
-      sources=$(curl -s "https://api.github.com/repos/fcsonline/tmux-thumbs/releases/latest" | grep browser_download_url)
-
-      case $platform in
-        Darwin_x86_64)
-          url=$(echo "${sources}" | grep -o 'https://.*darwin.zip' | uniq)
-          curl -sL "${url}" | bsdtar -xf - thumbs tmux-thumbs
-
-          ;;
-        Linux_x86_64)
-          url=$(echo "${sources}" | grep -o 'https://.*linux-musl.tar.gz' | uniq)
-          curl -sL "${url}" | tar -zxf - thumbs tmux-thumbs
-
-          ;;
-        *)
-          echo "❌ Unknown platform: ${platform}"
-          read -rs -n 1
-          echo "  Press any key to close this pane..."
-          exit 1
-          ;;
-      esac
-
-      chmod +x thumbs tmux-thumbs
-      mkdir -p target/release
-      mv thumbs tmux-thumbs target/release
-
-      break;;
-    *)
-      echo "❌ Ouh? Choose an available option."
-  esac
-done
+echo '  Compiling tmux-thumbs, be patient:'
+"${cargo[@]}" build --release --target-dir=target
 
 cat << EOF
   Installation complete! 💯
