@@ -44,15 +44,9 @@ fn app_args<'a>() -> clap::ArgMatches<'a> {
     )
     .arg(
       Arg::with_name("foreground_color")
-        .help("Sets the foregroud color for matches")
+        .help("Sets the underline color for matches")
         .long("fg-color")
         .default_value("green"),
-    )
-    .arg(
-      Arg::with_name("background_color")
-        .help("Sets the background color for matches")
-        .long("bg-color")
-        .default_value("black"),
     )
     .arg(
       Arg::with_name("hint_foreground_color")
@@ -80,15 +74,9 @@ fn app_args<'a>() -> clap::ArgMatches<'a> {
     )
     .arg(
       Arg::with_name("select_foreground_color")
-        .help("Sets the foreground color for selection")
+        .help("Sets the underline color for the selected match")
         .long("select-fg-color")
         .default_value("blue"),
-    )
-    .arg(
-      Arg::with_name("select_background_color")
-        .help("Sets the background color for selection")
-        .long("select-bg-color")
-        .default_value("black"),
     )
     .arg(
       Arg::with_name("multi")
@@ -162,11 +150,9 @@ fn main() {
   };
 
   let foreground_color = colors::get_color(args.value_of("foreground_color").unwrap());
-  let background_color = colors::get_color(args.value_of("background_color").unwrap());
   let hint_foreground_color = colors::get_color(args.value_of("hint_foreground_color").unwrap());
   let hint_background_color = colors::get_color(args.value_of("hint_background_color").unwrap());
   let select_foreground_color = colors::get_color(args.value_of("select_foreground_color").unwrap());
-  let select_background_color = colors::get_color(args.value_of("select_background_color").unwrap());
   let multi_foreground_color = colors::get_color(args.value_of("multi_foreground_color").unwrap());
   let multi_background_color = colors::get_color(args.value_of("multi_background_color").unwrap());
 
@@ -183,6 +169,7 @@ fn main() {
   let lines = plain.iter().map(String::as_str).collect::<Vec<&str>>();
 
   let mut state = state::State::new(&lines, alphabet, &regexp);
+  state.raw = output.split('\n').collect();
   state.spans = spans;
 
   let selected = {
@@ -194,11 +181,9 @@ fn main() {
       contrast,
       position,
       select_foreground_color,
-      select_background_color,
       multi_foreground_color,
       multi_background_color,
       foreground_color,
-      background_color,
       hint_foreground_color,
       hint_background_color,
     );

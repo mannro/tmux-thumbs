@@ -97,12 +97,10 @@ NOTE: for changes to take effect, you'll need to source again your `.tmux.conf` 
 * [@thumbs-command](#thumbs-command)
 * [@thumbs-upcase-command](#thumbs-upcase-command)
 * [@thumbs-multi-command](#thumbs-multi-command)
-* [@thumbs-bg-color](#thumbs-bg-color)
 * [@thumbs-fg-color](#thumbs-fg-color)
 * [@thumbs-hint-bg-color](#thumbs-hint-bg-color)
 * [@thumbs-hint-fg-color](#thumbs-hint-fg-color)
 * [@thumbs-select-fg-color](#thumbs-select-fg-color)
-* [@thumbs-select-bg-color](#thumbs-select-bg-color)
 * [@thumbs-multi-fg-color](#thumbs-multi-fg-color)
 * [@thumbs-multi-bg-color](#thumbs-multi-bg-color)
 * [@thumbs-contrast](#thumbs-contrast)
@@ -240,23 +238,11 @@ For example:
 set -g @thumbs-multi-command 'echo -n {}'
 ```
 
-### @thumbs-bg-color
-
-`default: black`
-
-Sets the background color for matches
-
-For example:
-
-```
-set -g @thumbs-bg-color blue
-```
-
 ### @thumbs-fg-color
 
 `default: green`
 
-Sets the foreground color for matches
+Sets the underline color for matches. Matched text keeps its own colors.
 
 For example:
 
@@ -292,24 +278,12 @@ set -g @thumbs-hint-fg-color green
 
 `default: blue`
 
-Sets the foreground color for selection
+Sets the underline color for the selected match
 
 For example:
 
 ```
 set -g @thumbs-select-fg-color red
-```
-
-### @thumbs-select-bg-color
-
-`default: black`
-
-Sets the background color for selection
-
-For example:
-
-```
-set -g @thumbs-select-bg-color red
 ```
 
 ### @thumbs-multi-fg-color
@@ -465,8 +439,7 @@ FLAGS:
 
 OPTIONS:
     -a, --alphabet <alphabet>                          Sets the alphabet [default: qwerty]
-        --bg-color <background_color>                  Sets the background color for matches [default: black]
-        --fg-color <foreground_color>                  Sets the foregroud color for matches [default: green]
+        --fg-color <foreground_color>                  Sets the underline color for matches [default: green]
     -f, --format <format>
             Specifies the out format for the picked hint. (%U: Upcase, %H: Hint) [default: %H]
 
@@ -474,11 +447,11 @@ OPTIONS:
         --hint-fg-color <hint_foreground_color>        Sets the foregroud color for hints [default: yellow]
     -p, --position <position>                          Hint position [default: left]
     -x, --regexp <regexp>...                           Use this regexp as extra pattern to match
-        --select-bg-color <select_background_color>    Sets the background color for selection [default: black]
-        --select-fg-color <select_foreground_color>    Sets the foreground color for selection [default: blue]
+        --select-fg-color <select_foreground_color>    Sets the underline color for the selected match [default: blue]
         --multi-bg-color <multi_background_color>      Sets the background color for a multi selected item [default: black]
         --multi-fg-color <multi_foreground_color>      Sets the foreground color for a multi selected item [default: cyan]
     -t, --target <target>                              Stores the hint in the specified path
+        --span-color <span_color>                      Also match text drawn in these foreground colors (#rrggbb, comma separated)
 ```
 
 

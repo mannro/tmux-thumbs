@@ -2,8 +2,6 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::fmt;
 
-const EXCLUDE_PATTERNS: [(&'static str, &'static str); 1] = [("bash", r"[[:cntrl:]]\[([0-9]{1,2};)?([0-9]{1,2})?m")];
-
 const PATTERNS: [(&'static str, &'static str); 15] = [
   ("markdown_url", r"\[[^]]*\]\(([^)]+)\)"),
   ("url", r"(?P<match>(https?://|git@|git://|ssh://|ftp://|file:///)[^ ]+)"),
@@ -56,10 +54,51 @@ impl<'a> PartialEq for Match<'a> {
 
 pub struct State<'a> {
   pub lines: &'a Vec<&'a str>,
+  /// The captured lines with escape sequences, rendered with their original colors.
+  pub raw: Vec<&'a str>,
   /// Per line byte ranges matched by foreground color (see `parse_ansi`).
   pub spans: Vec<Vec<(usize, usize)>>,
   alphabet: &'a str,
   regexp: &'a Vec<&'a str>,
+}
+
+pub enum Token<'a> {
+  Char(char),
+  Escape(&'a str),
+}
+
+/// Splits a `capture-pane -e` line into printable chars and escape sequences.
+pub fn tokens(line: &str) -> impl Iterator<Item = Token<'_>> {
+  let mut rest = line;
+  std::iter::from_fn(move || {
+    let c = rest.chars().next()?;
+    let len = if c == '\x1b' { escape_len(rest) } else { c.len_utf8() };
+    let (token, tail) = rest.split_at(len);
+    rest = tail;
+    Some(if c == '\x1b' { Token::Escape(token) } else { Token::Char(c) })
+  })
+}
+
+fn escape_len(s: &str) -> usize {
+  let bytes = s.as_bytes();
+  match bytes.get(1) {
+    // CSI: params until a final byte.
+    Some(b'[') => bytes[2..].iter().position(|b| (0x40..=0x7e).contains(b)).map_or(bytes.len(), |i| i + 3),
+    // OSC (hyperlinks): until BEL or ST (`ESC \`).
+    Some(b']') => (2..bytes.len())
+      .find_map(|i| match (bytes[i], bytes.get(i + 1)) {
+        (0x07, _) => Some(i + 1),
+        (0x1b, Some(b'\\')) => Some(i + 2),
+        _ => None,
+      })
+      .unwrap_or(bytes.len()),
+    _ => 1 + s[1..].chars().next().map_or(0, char::len_utf8),
+  }
+}
+
+/// Parameters of an SGR (`ESC [ ... m`) escape.
+pub fn sgr(escape: &str) -> Option<&str> {
+  escape.strip_prefix("\x1b[")?.strip_suffix('m')
 }
 
 /// Strips escape sequences from a `capture-pane -e` line. Returns the plain text
@@ -70,36 +109,17 @@ pub fn parse_ansi(line: &str, colors: &[(u8, u8, u8)]) -> (String, Vec<(usize, u
   let mut spans = Vec::new();
   let mut fg: Option<(u8, u8, u8)> = None;
   let mut start: Option<usize> = None;
-  let mut chars = line.chars().peekable();
 
-  while let Some(c) = chars.next() {
-    if c == '\x1b' {
-      match chars.next() {
-        // CSI: params until a final byte, only SGR (`m`) changes colors.
-        Some('[') => {
-          let mut seq = String::new();
-          for c in chars.by_ref() {
-            if ('@'..='~').contains(&c) {
-              if c == 'm' {
-                fg = sgr_foreground(&seq, fg);
-              }
-              break;
-            }
-            seq.push(c);
-          }
+  for token in tokens(line) {
+    let c = match token {
+      Token::Char(c) => c,
+      Token::Escape(escape) => {
+        if let Some(params) = sgr(escape) {
+          fg = sgr_foreground(params, fg);
         }
-        // OSC (hyperlinks): until BEL or ST (`ESC \`).
-        Some(']') => {
-          while let Some(c) = chars.next() {
-            if c == '\x07' || (c == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
-              break;
-            }
-          }
-        }
-        _ => {}
+        continue;
       }
-      continue;
-    }
+    };
 
     let colored = fg.map_or(false, |fg| colors.contains(&fg));
     match start {
@@ -159,6 +179,7 @@ impl<'a> State<'a> {
   pub fn new(lines: &'a Vec<&'a str>, alphabet: &'a str, regexp: &'a Vec<&'a str>) -> State<'a> {
     State {
       lines,
+      raw: Vec::new(),
       spans: Vec::new(),
       alphabet,
       regexp,
@@ -167,11 +188,6 @@ impl<'a> State<'a> {
 
   pub fn matches(&self, reverse: bool, unique: bool) -> Vec<Match<'a>> {
     let mut matches = Vec::new();
-
-    let exclude_patterns = EXCLUDE_PATTERNS
-      .iter()
-      .map(|tuple| (tuple.0, Regex::new(tuple.1).unwrap()))
-      .collect::<Vec<_>>();
 
     let custom_patterns = self
       .regexp
@@ -185,7 +201,7 @@ impl<'a> State<'a> {
       .collect::<Vec<_>>();
 
     // This order determines the priority of pattern matching
-    let all_patterns = [exclude_patterns, custom_patterns, patterns].concat();
+    let all_patterns = [custom_patterns, patterns].concat();
 
     for (index, line) in self.lines.iter().enumerate() {
       let mut chunk: &str = line;
@@ -222,17 +238,14 @@ impl<'a> State<'a> {
               [(matching.as_str(), 0)].to_vec()
             };
 
-            // Never hint or broke bash color sequences, but process it
-            if *name != "bash" {
-              for (subtext, substart) in captures.iter() {
-                matches.push(Match {
-                  x: offset + matching.start() as i32 + *substart as i32,
-                  y: index as i32,
-                  pattern: name,
-                  text: subtext,
-                  hint: None,
-                });
-              }
+            for (subtext, substart) in captures.iter() {
+              matches.push(Match {
+                x: offset + matching.start() as i32 + *substart as i32,
+                y: index as i32,
+                pattern: name,
+                text: subtext,
+                hint: None,
+              });
             }
 
             chunk = chunk.get(matching.end()..).expect("Unknown chunk");
@@ -361,14 +374,17 @@ mod tests {
 
   #[test]
   fn match_bash() {
-    let lines = split("path: [32m/var/log/nginx.log[m\npath: [32mtest/log/nginx-2.log:32[mfolder/.nginx@4df2.log");
+    let raw = "path: \x1b[32m/var/log/nginx.log\x1b[m\npath: \x1b[32mtest/log/nginx-2.log:32\x1b[mfolder/.nginx@4df2.log";
+    let plain = raw.split('\n').map(|line| parse_ansi(line, &[]).0).collect::<Vec<_>>();
+    let lines = plain.iter().map(String::as_str).collect::<Vec<_>>();
     let custom = [].to_vec();
     let results = State::new(&lines, "abcd", &custom).matches(false, false);
 
     assert_eq!(results.len(), 3);
     assert_eq!(results.get(0).unwrap().text, "/var/log/nginx.log");
     assert_eq!(results.get(1).unwrap().text, "test/log/nginx-2.log");
-    assert_eq!(results.get(2).unwrap().text, "folder/.nginx@4df2.log");
+    // Escapes are stripped first, so the match follows the text on screen.
+    assert_eq!(results.get(2).unwrap().text, "32folder/.nginx@4df2.log");
   }
 
   #[test]

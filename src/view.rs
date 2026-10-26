@@ -18,11 +18,9 @@ pub struct View<'a> {
   position: &'a str,
   matches: Vec<state::Match<'a>>,
   select_foreground_color: Box<dyn color::Color>,
-  select_background_color: Box<dyn color::Color>,
   multi_foreground_color: Box<dyn color::Color>,
   multi_background_color: Box<dyn color::Color>,
   foreground_color: Box<dyn color::Color>,
-  background_color: Box<dyn color::Color>,
   hint_background_color: Box<dyn color::Color>,
   hint_foreground_color: Box<dyn color::Color>,
   chosen: Vec<(String, bool)>,
@@ -42,11 +40,9 @@ impl<'a> View<'a> {
     contrast: bool,
     position: &'a str,
     select_foreground_color: Box<dyn color::Color>,
-    select_background_color: Box<dyn color::Color>,
     multi_foreground_color: Box<dyn color::Color>,
     multi_background_color: Box<dyn color::Color>,
     foreground_color: Box<dyn color::Color>,
-    background_color: Box<dyn color::Color>,
     hint_foreground_color: Box<dyn color::Color>,
     hint_background_color: Box<dyn color::Color>,
   ) -> View<'a> {
@@ -61,11 +57,9 @@ impl<'a> View<'a> {
       position,
       matches,
       select_foreground_color,
-      select_background_color,
       multi_foreground_color,
       multi_background_color,
       foreground_color,
-      background_color,
       hint_foreground_color,
       hint_background_color,
       chosen: vec![],
@@ -95,34 +89,37 @@ impl<'a> View<'a> {
   fn render(&self, stdout: &mut dyn Write, typed_hint: &str) -> () {
     write!(stdout, "{}", cursor::Hide).unwrap();
 
+    let selected = self.matches.get(self.skip);
+
     for (index, line) in self.state.lines.iter().enumerate() {
       let clean = line.trim_end_matches(|c: char| c.is_whitespace());
 
       if !clean.is_empty() {
-        print!("{goto}{text}", goto = cursor::Goto(1, index as u16 + 1), text = line);
+        let mut marks = self
+          .matches
+          .iter()
+          .filter(|mat| mat.y == index as i32)
+          .map(|mat| {
+            let color = if selected == Some(mat) {
+              &self.select_foreground_color
+            } else {
+              &self.foreground_color
+            };
+            (mat.x as usize, mat.x as usize + mat.text.len(), underline(&**color))
+          })
+          .collect::<Vec<_>>();
+        marks.sort_by_key(|mark| mark.0);
+
+        let raw = self.state.raw.get(index).copied().unwrap_or(line);
+        print!(
+          "{goto}{text}",
+          goto = cursor::Goto(1, index as u16 + 1),
+          text = underline_ranges(raw, &marks)
+        );
       }
     }
 
-    let selected = self.matches.get(self.skip);
-
     for mat in self.matches.iter() {
-      let chosen_hint = self.chosen.iter().any(|(hint, _)| hint == mat.text);
-
-      let selected_color = if chosen_hint {
-        &self.multi_foreground_color
-      } else if selected == Some(mat) {
-        &self.select_foreground_color
-      } else {
-        &self.foreground_color
-      };
-      let selected_background_color = if chosen_hint {
-        &self.multi_background_color
-      } else if selected == Some(mat) {
-        &self.select_background_color
-      } else {
-        &self.background_color
-      };
-
       // Find long utf sequences and extract it from mat.x
       let line = &self.state.lines[mat.y as usize];
       let prefix = &line[0..mat.x as usize];
@@ -130,17 +127,19 @@ impl<'a> View<'a> {
       let offset = (mat.x as u16) - (extra as u16);
       let text = self.make_hint_text(mat.text);
 
-      print!(
-        "{goto}{background}{foregroud}{underline}{text}{nounderline}{resetf}{resetb}",
-        goto = cursor::Goto(offset + 1, mat.y as u16 + 1),
-        foregroud = color::Fg(&**selected_color),
-        background = color::Bg(&**selected_background_color),
-        underline = style::Underline,
-        nounderline = style::NoUnderline,
-        resetf = color::Fg(color::Reset),
-        resetb = color::Bg(color::Reset),
-        text = &text
-      );
+      if self.chosen.iter().any(|(hint, _)| hint == mat.text) {
+        print!(
+          "{goto}{background}{foregroud}{underline}{text}{nounderline}{resetf}{resetb}",
+          goto = cursor::Goto(offset + 1, mat.y as u16 + 1),
+          foregroud = color::Fg(&*self.multi_foreground_color),
+          background = color::Bg(&*self.multi_background_color),
+          underline = style::Underline,
+          nounderline = style::NoUnderline,
+          resetf = color::Fg(color::Reset),
+          resetb = color::Bg(color::Reset),
+          text = &text
+        );
+      }
 
       if let Some(ref hint) = mat.hint {
         let extra_position = match self.position {
@@ -310,6 +309,50 @@ impl<'a> View<'a> {
   }
 }
 
+const NO_UNDERLINE: &str = "\x1b[24;59m";
+
+/// Underline escape in `color` (SGR 58). termion has no underline color, so reuse its foreground escape.
+fn underline(color: &dyn color::Color) -> String {
+  let foreground = color::Fg(color).to_string();
+  format!("{}{}", style::Underline, foreground.replace("[38;", "[58;").replace("[39m", "[59m"))
+}
+
+/// Prints `raw` (a captured line with escapes) and underlines `marks`: plain text byte ranges with their
+/// underline escape. The text keeps its own colors, like URLs in foot.
+fn underline_ranges(raw: &str, marks: &[(usize, usize, String)]) -> String {
+  let mut out = String::with_capacity(raw.len() + marks.len() * 32);
+  let mut marks = marks.iter().peekable();
+  let mut open: Option<&(usize, usize, String)> = None;
+  let mut position = 0;
+
+  for token in state::tokens(raw) {
+    match token {
+      state::Token::Escape(escape) => {
+        out.push_str(escape);
+        // An SGR inside the match (for example a reset) can drop the underline.
+        if let (Some(mark), Some(_)) = (open, state::sgr(escape)) {
+          out.push_str(&mark.2);
+        }
+      }
+      state::Token::Char(c) => {
+        if open.map_or(false, |mark| mark.1 == position) {
+          out.push_str(NO_UNDERLINE);
+          open = None;
+        }
+        if let Some(mark) = marks.next_if(|mark| mark.0 == position) {
+          out.push_str(&mark.2);
+          open = Some(mark);
+        }
+        out.push(c);
+        position += c.len_utf8();
+      }
+    }
+  }
+
+  out.push_str("\x1b[0m");
+  out
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -331,11 +374,9 @@ mod tests {
       position: &"",
       matches: vec![],
       select_foreground_color: colors::get_color("default"),
-      select_background_color: colors::get_color("default"),
       multi_foreground_color: colors::get_color("default"),
       multi_background_color: colors::get_color("default"),
       foreground_color: colors::get_color("default"),
-      background_color: colors::get_color("default"),
       hint_background_color: colors::get_color("default"),
       hint_foreground_color: colors::get_color("default"),
       chosen: vec![],
@@ -347,5 +388,16 @@ mod tests {
     view.contrast = true;
     let result = view.make_hint_text("a");
     assert_eq!(result, "[a]".to_string());
+  }
+
+  #[test]
+  fn underline_keeps_colors() {
+    let raw = "To \x1b[38;2;1;2;3mhttps://a.b\x1b[0m and /tmp";
+    let marks = [(3, 14, "<u>".to_string()), (19, 23, "<v>".to_string())];
+
+    assert_eq!(
+      underline_ranges(raw, &marks),
+      "To \x1b[38;2;1;2;3m<u>https://a.b\x1b[0m<u>\x1b[24;59m and <v>/tmp\x1b[0m"
+    );
   }
 }
